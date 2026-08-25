@@ -2,15 +2,16 @@
 //  LockdownClient.swift
 //  Services
 //
-//  Minimale lockdownd-client: property-list-berichten met een 4-byte big-endian
-//  lengte-prefix over een TCP-stroom. Genoeg om `QueryType` te doen en met
-//  `StartService` een servicekanaal (zoals com.apple.dt.simulatelocation) te
-//  laten openen.
+//  Lockdownd-client bovenop SocketChannel. Berichten zijn property lists met een
+//  4-byte big-endian lengte-prefix. Implementeert de minimale sequentie:
 //
-//  Let op: lockdownd is een host-side protocol (usbmux). Deze client werkt
-//  alleen wanneer er daadwerkelijk een lockdownd-endpoint op de opgegeven poort
-//  luistert; op een standaard iOS-toestel is dat vanuit de app-sandbox niet het
-//  geval. Zie de README, Module 2.
+//      QueryType  ->  StartSession (met HostID/SystemBUID uit de pairing record)
+//                 ->  TLS-upgrade (als EnableSessionSSL)
+//                 ->  StartService (bijv. com.apple.dt.simulatelocation)
+//
+//  Let op: lockdownd is een host-side (usbmux) protocol. Deze client werkt alleen
+//  wanneer er echt een lockdownd-endpoint op de opgegeven poort luistert en de
+//  pairing record bij dit toestel hoort. Zie de README, Module 2.
 //
 
 import Foundation
@@ -21,22 +22,19 @@ final class LockdownClient {
     enum LockdownError: LocalizedError, Equatable {
         case invalidResponse
         case unexpectedType(String)
+        case sessionRefused(String)
         case serviceError(String)
         case messageTooLarge(UInt32)
         case serializationFailed
 
         var errorDescription: String? {
             switch self {
-            case .invalidResponse:
-                return "lockdownd stuurde een onbegrijpelijk antwoord."
-            case .unexpectedType(let type):
-                return "Onverwacht lockdownd-type: \(type)."
-            case .serviceError(let message):
-                return "lockdownd weigerde de service: \(message)"
-            case .messageTooLarge(let length):
-                return "lockdownd-bericht te groot: \(length) bytes."
-            case .serializationFailed:
-                return "Kon het lockdownd-bericht niet (de)serialiseren."
+            case .invalidResponse: return "lockdownd stuurde een onbegrijpelijk antwoord."
+            case .unexpectedType(let type): return "Onverwacht lockdownd-type: \(type)."
+            case .sessionRefused(let message): return "lockdownd weigerde de sessie: \(message)"
+            case .serviceError(let message): return "lockdownd weigerde de service: \(message)"
+            case .messageTooLarge(let length): return "lockdownd-bericht te groot: \(length) bytes."
+            case .serializationFailed: return "Kon het lockdownd-bericht niet (de)serialiseren."
             }
         }
     }
@@ -46,44 +44,66 @@ final class LockdownClient {
         let sslEnabled: Bool
     }
 
-    /// Antwoorden groter dan dit accepteren we niet; een lockdownd-plist is klein.
     private static let maximumMessageLength: UInt32 = 1 << 22 // 4 MiB
 
-    private let connection: TCPConnection
+    private let channel: SocketChannel
     private let logger = Logger(subsystem: TunnelConstants.loggingSubsystem, category: "LockdownClient")
+    private var sessionID: String?
 
-    init(connection: TCPConnection) {
-        self.connection = connection
+    init(channel: SocketChannel) {
+        self.channel = channel
     }
 
+    // MARK: - Verbinden
+
     func open() async throws {
-        try await connection.open()
+        try await channel.connect()
     }
 
     func close() {
-        connection.close()
+        channel.close()
     }
 
-    // MARK: - Handshake-stappen
+    // MARK: - Handshake
 
-    /// Vraagt het servicetype op. Voor lockdownd hoort dat
+    /// Vraagt het servicetype op; voor lockdownd hoort dat
     /// `com.apple.mobile.lockdown` te zijn.
     @discardableResult
     func queryType() async throws -> String {
         try await send(["Request": "QueryType"])
         let response = try await receive()
-        guard let type = response["Type"] as? String else {
-            throw LockdownError.invalidResponse
-        }
+        guard let type = response["Type"] as? String else { throw LockdownError.invalidResponse }
         return type
+    }
+
+    /// Start een sessie met de host-credentials en upgradet de verbinding naar
+    /// TLS wanneer lockdownd daarom vraagt (`EnableSessionSSL`).
+    func startSession(pairingRecord: PairingRecord) async throws {
+        try await send([
+            "Request": "StartSession",
+            "HostID": pairingRecord.hostID,
+            "SystemBUID": pairingRecord.systemBUID
+        ])
+        let response = try await receive()
+
+        if let error = response["Error"] as? String {
+            throw LockdownError.sessionRefused(error)
+        }
+        sessionID = response["SessionID"] as? String
+
+        if (response["EnableSessionSSL"] as? Bool) == true {
+            let credentials = TLSCredentials(
+                identity: try pairingRecord.makeClientIdentity(),
+                pinnedCertificateDER: pairingRecord.deviceCertificateDER
+            )
+            try await channel.startTLS(credentials: credentials)
+            logger.log("lockdownd-sessie naar TLS geüpgraded.")
+        }
     }
 
     /// Vraagt lockdownd om een service te starten en geeft de toegewezen poort terug.
     func startService(_ service: String) async throws -> ServiceDescriptor {
-        try await send([
-            "Request": "StartService",
-            "Service": service
-        ])
+        try await send(["Request": "StartService", "Service": service])
         let response = try await receive()
 
         if let error = response["Error"] as? String {
@@ -97,33 +117,37 @@ final class LockdownClient {
         return ServiceDescriptor(port: UInt16(portValue), sslEnabled: ssl)
     }
 
+    /// Sluit de sessie netjes af (best effort).
+    func stopSession() async throws {
+        guard let sessionID else { return }
+        try await send(["Request": "StopSession", "SessionID": sessionID])
+        _ = try? await receive()
+        self.sessionID = nil
+    }
+
     // MARK: - Bericht-framing
 
     private func send(_ message: [String: Any]) async throws {
         let body: Data
         do {
-            body = try PropertyListSerialization.data(fromPropertyList: message,
-                                                      format: .xml,
-                                                      options: 0)
+            body = try PropertyListSerialization.data(fromPropertyList: message, format: .xml, options: 0)
         } catch {
             throw LockdownError.serializationFailed
         }
         let length = UInt32(body.count).bigEndian
         var framed = withUnsafeBytes(of: length) { Data($0) }
         framed.append(body)
-        try await connection.send(framed)
+        try await channel.send(framed)
     }
 
     private func receive() async throws -> [String: Any] {
-        let header = try await connection.receive(exactly: 4)
+        let header = try await channel.receive(exactly: 4)
         let length = header.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }.bigEndian
         guard length > 0 else { throw LockdownError.invalidResponse }
         guard length <= Self.maximumMessageLength else { throw LockdownError.messageTooLarge(length) }
 
-        let body = try await connection.receive(exactly: Int(length))
-        guard let plist = try? PropertyListSerialization.propertyList(from: body,
-                                                                      options: [],
-                                                                      format: nil),
+        let body = try await channel.receive(exactly: Int(length))
+        guard let plist = try? PropertyListSerialization.propertyList(from: body, options: [], format: nil),
               let dictionary = plist as? [String: Any] else {
             throw LockdownError.invalidResponse
         }
