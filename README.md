@@ -94,38 +94,49 @@ wordt wél gebruikt als `tunnelRemoteAddress` en als `serverAddress` in Instelli
 
 ---
 
-# Module 2 — Communicatieprotocol (`LocationSimulatorService`)
+# Module 2 — Lockdown & Protocol Service
 
-Een Swift 6-compliant client die het `com.apple.dt.simulatelocation`-protocol van
-Apple spreekt over een TCP-socket, opgezet met `Network.framework` (`NWConnection`)
-richting `127.0.0.1` (uit `TunnelConstants`).
+Een Swift 6-compliant client die zich met een **pairing record** bij lockdownd
+authenticeert, de verbinding naar **TLS** upgradet en daarna het
+`com.apple.dt.simulatelocation`-protocol spreekt.
 
 ### Bestanden (`Services/`)
 
 | Bestand | Rol |
 | --- | --- |
-| `Services/TCPConnection.swift` | Async/await-schil rond `NWConnection`: `open`, `send`, `receive(exactly:)`, `close` |
-| `Services/LockdownClient.swift` | Minimale lockdownd-client: plist-berichten met 4-byte big-endian lengte-prefix, `QueryType` + `StartService` |
-| `Services/LocationSimulatorService.swift` | `actor` met `connectToLockdownd(port:)`, `sendSimulateLocation(latitude:longitude:)`, `stopSimulation()`, `simulate(...)`, `disconnect()` |
-| `Tests/LocationSimulatorEncodingTests.swift` | Swift Testing-dekking voor de wire-encoding |
+| `Services/PEM.swift` | PEM ↔ DER-helper voor de certificaten/sleutels uit de pairing record |
+| `Services/PairingRecord.swift` | Parser voor de `.plist`/`.bplist` pairing record; bouwt de client-`SecIdentity` en pint het device-certificaat |
+| `Services/SocketChannel.swift` | Rauwe POSIX-socket met Secure Transport (`SSLContext`) STARTTLS-upgrade midden in de stream |
+| `Services/LockdownClient.swift` | lockdownd-handshake: `QueryType` → `StartSession` → TLS → `StartService` |
+| `Services/LocationSimulatorService.swift` | `actor` met `connectToLockdownd(pairingRecord:port:)`, `sendSimulateLocation(latitude:longitude:)`, `stopSimulation()`, `disconnect()` |
+| `Tests/LocationSimulatorEncodingTests.swift` | Wire-encoding + big-endian double-helper |
+| `Tests/PairingRecordTests.swift` | PEM-decode en pairing-record-parsing |
 
-### Belangrijk: haalbaarheid
+### Waarom een rauwe socket en niet `NWConnection`
 
-`com.apple.dt.simulatelocation` en `lockdownd` zijn **host-side** protocollen. Ze
-draaien op het toestel maar worden vanaf een *computer* aangesproken via usbmux/USB
-(zoals Xcode en libimobiledevice doen). Een gesandboxte iOS-app die op het toestel
-zelf draait kan `lockdownd` **niet** bereiken via `127.0.0.1` — ook niet via de
-tunnel uit Module 1, want die vangt IP-pakketten, terwijl simulatelocation over het
-usbmux/lockdown-kanaal loopt (geen bereikbare IP-service).
+Lockdown doet eerst een **plaintext** `StartSession` en upgradet daarna *dezelfde*
+socket naar TLS (STARTTLS-stijl). `NWConnection` kan geen TLS starten midden in een
+bestaande stream — daar moet TLS bij het opzetten al vaststaan. De enige manier die
+op iOS wél een in-stream upgrade doet, is een rauwe POSIX-socket met **Secure
+Transport** (`SSLContext` + `SSLSetIOFuncs`) eroverheen; dat is ook wat de
+libimobiledevice-poorten op Apple-platforms doen. `SSLContext` is deprecated maar
+functioneel. De client-identity komt uit de pairing record; de peer wordt gepind op
+het `DeviceCertificate` in plaats van via keten-validatie (het zijn
+zelfondertekende certificaten).
 
-Deze code is een **correcte client voor het protocol**. Hij werkt zodra er echt een
-lockdownd-endpoint op de opgegeven poort luistert (een host-context, een relay die
-de tunnel doorstuurt, of een jailbreak-omgeving). Op een standaard toestel vanuit de
-app-sandbox zal de verbinding worden geweigerd (`.transport(...)`-fout).
+### Handshake-sequentie
+
+```
+verbind (plaintext) ──▶ QueryType            (verwacht com.apple.mobile.lockdown)
+                    ──▶ StartSession          (HostID + SystemBUID uit de pairing record)
+                    ──▶ TLS-upgrade           (als EnableSessionSSL: client-cert + pin)
+                    ──▶ StartService           (com.apple.dt.simulatelocation → poort)
+        nieuw kanaal ──▶ (TLS als EnableServiceSSL) ──▶ locatiecommando's
+```
 
 ### Wire-formaat
 
-Het echte simulatelocation-protocol stuurt de coördinaten als **lengte-geprefixte
+Het simulatelocation-protocol stuurt de coördinaten als **lengte-geprefixte
 ASCII-strings**, voorafgegaan door een 4-byte big-endian commandowoord:
 
 ```
@@ -141,18 +152,82 @@ maar het simulatelocation-kanaal zelf gebruikt strings, geen doubles.
 ### Gebruik
 
 ```swift
-let simulator = LocationSimulatorService()          // host: 127.0.0.1
+let simulator = LocationSimulatorService(host: "127.0.0.1")   // of het Wi-Fi-IP van het toestel
 
-try await simulator.connectToLockdownd()            // QueryType + StartService
-try await simulator.sendSimulateLocation(latitude: 37.7749, longitude: -122.4194)
+// Pairing record via .fileImporter (Module 4) of uit de app-bundle:
+try await simulator.connectToLockdownd(pairingRecordURL: url)
+try await simulator.sendSimulateLocation(latitude: 52.3676, longitude: 4.9041)
 // … later:
 try await simulator.stopSimulation()
 await simulator.disconnect()
-
-// Of in één keer:
-try await simulator.simulate(latitude: 52.3676, longitude: 4.9041)
 ```
 
-De `NWConnection` wordt automatisch gesloten bij elke verzend-/verbindingsfout en
-bij `disconnect()`. `LocationSimulatorService` is een `actor`, dus de socket-state
-wordt serieel en Swift 6-veilig beheerd.
+De socket wordt automatisch gesloten bij elke verzend-/verbindings-/TLS-fout en bij
+`disconnect()`. `LocationSimulatorService` is een `actor`, en `SocketChannel`
+serialiseert alle fd/TLS-toegang op één queue — Swift 6-veilig.
+
+### Belangrijk: haalbaarheid
+
+`com.apple.dt.simulatelocation` vereist dat de Developer Disk Image gemount is. Op
+iOS 17+ is dat een **gepersonaliseerde DDI** die vooraf via een PC/Mac gemount moet
+zijn (Module 3 is daarom geschrapt), en zijn developer-services bovendien verhuisd
+naar **RemoteServiceDiscovery**. lockdownd en simulatelocation zijn van oorsprong
+host-side (usbmux) protocollen. Deze client implementeert het **klassieke
+lockdown-pad** correct — inclusief de pairing-TLS-upgrade — en is bedoeld als
+educatieve/functionele re-implementatie. Of hij op een concreet toestel/iOS-versie
+daadwerkelijk een locatie zet, hangt af van of dat pad daar beschikbaar is gemaakt.
+
+> Deze code is niet gecompileerd of tegen een fysiek toestel getest in deze omgeving
+> (geen Swift-toolchain aanwezig). De low-level Secure Transport- en keychain-paden
+> zijn zorgvuldig geschreven volgens de betreffende API's, maar device-specifieke
+> TLS-parameters kunnen tuning vereisen.
+
+---
+
+# Module 4 — SwiftUI-frontend
+
+Een moderne iOS 17+-interface (getest tegen iPhone 17 Pro Max / iOS 26.5.2) die de
+modules aan elkaar knoopt.
+
+### Bestanden (`App/`)
+
+| Bestand | Rol |
+| --- | --- |
+| `App/ContentView.swift` | Kaart, `.fileImporter`, status-badges en de 'Start Spoofing'-knop |
+| `App/SpoofingViewModel.swift` | `@MainActor ObservableObject` die de keten orkestreert (VPN → pairing/TLS → coördinaten) |
+
+### Wat de UI doet
+
+- **Kaart** — moderne MapKit `Map` binnen een `MapReader`; een tik wordt via
+  `proxy.convert(_:from:)` omgezet naar een `CLLocationCoordinate2D` en getoond als
+  rode `Marker`. Tikken terwijl de simulatie actief is, verplaatst de gesimuleerde
+  locatie meteen.
+- **Pairing File** — `.fileImporter` voor het `.bplist` bestand. Het bestand wordt
+  binnen security-scoped toegang ingelezen en direct als `PairingRecord`
+  gevalideerd, zodat fouten meteen zichtbaar zijn.
+- **Status-badges** — VPN-status (uit `VPNManager`, Module 1) en protocol-status
+  (uit de keten-fase, Module 2), met kleur die de toestand volgt.
+- **Host-veld** — standaard `127.0.0.1` (via de tunnel), of het Wi-Fi-IP van het
+  toestel.
+- **Start Spoofing** — draait de keten asynchroon:
+  1. `VPNManager.start()` en wachten tot de tunnel `.connected` is (met time-out),
+  2. `LocationSimulatorService.connectToLockdownd(pairingRecord:)` (lockdown + TLS),
+  3. `sendSimulateLocation(latitude:longitude:)`.
+  De knop wordt 'Stop Spoofing' zodra de locatie actief is en zet alles weer terug.
+- **Foutafhandeling** — elke fase-fout landt in een `Alert` met een leesbare
+  beschrijving; de keten sluit het kanaal netjes af.
+
+### Wiring
+
+Zet `ContentView` als root:
+
+```swift
+@main
+struct LocationSimulatorApp: App {
+    var body: some Scene { WindowGroup { ContentView() } }
+}
+```
+
+Target membership: `App/*.swift` hoort bij de **app**, samen met `Shared/*.swift` en
+`Services/*.swift`. (`Services/` heeft geen `NetworkExtension` nodig en draait in het
+app-proces.)
