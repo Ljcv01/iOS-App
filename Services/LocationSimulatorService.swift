@@ -3,23 +3,29 @@
 //  Services
 //
 //  Spreekt het `com.apple.dt.simulatelocation`-protocol van Apple over een
-//  TCP-socket, opgezet via de lokale tunnel uit Module 1 (host 127.0.0.1).
+//  (eventueel TLS-beveiligde) socket, opgezet via de lockdown-handshake met een
+//  pairing record.
 //
-//  Een `actor`, zodat de socket-state serieel en Swift 6-veilig wordt beheerd:
-//  er is nooit gelijktijdige toegang tot dezelfde verbinding.
+//  Een `actor`, zodat de socket-state serieel en Swift 6-veilig wordt beheerd.
 //
-//  BELANGRIJK OVER HET WIRE-FORMAAT
-//  --------------------------------
-//  Het echte simulatelocation-protocol stuurt de coördinaten als
-//  lengte-geprefixte ASCII-strings, voorafgegaan door een 4-byte big-endian
-//  commandowoord (0 = locatie zetten, 1 = simulatie stoppen). Dat is exact wat
-//  Apples devicetools en libimobiledevice's `idevicesetlocation` doen, en het is
-//  wat het toestel accepteert. Dat implementeren we hieronder.
+//  WIRE-FORMAAT
+//  ------------
+//  Het simulatelocation-protocol stuurt de coördinaten als lengte-geprefixte
+//  ASCII-strings, voorafgegaan door een 4-byte big-endian commandowoord
+//  (0 = locatie zetten, 1 = simulatie stoppen). Dat is exact wat Apples
+//  devicetools en libimobiledevice's `idevicesetlocation` doen.
 //
-//  De in de opdracht gevraagde big-endian IEEE-754 double-serialisatie zit als
-//  herbruikbare helper in `Double.bigEndianBytes` (onderaan dit bestand), voor
-//  het geval je die voor een andere variant nodig hebt — maar het
-//  simulatelocation-kanaal zelf gebruikt strings, niet doubles.
+//  De in de opdracht genoemde big-endian IEEE-754 double-serialisatie zit als
+//  herbruikbare helper in `Double.bigEndianBytes` (onderaan) — het
+//  simulatelocation-kanaal zelf gebruikt echter strings, geen doubles.
+//
+//  HAALBAARHEID
+//  ------------
+//  simulatelocation vereist dat de Developer Disk Image gemount is. Op iOS 17+
+//  is dat een gepersonaliseerde DDI die vooraf via een PC/Mac gemount moet zijn,
+//  en zijn developer-services bovendien verhuisd naar RemoteServiceDiscovery.
+//  Deze client implementeert het klassieke lockdown-pad correct; op moderne iOS
+//  werkt hij alleen wanneer dat pad daadwerkelijk beschikbaar is gemaakt.
 //
 
 import Foundation
@@ -34,7 +40,6 @@ actor LocationSimulatorService {
         case invalidCoordinate(latitude: Double, longitude: Double)
         case handshakeFailed(String)
         case serviceUnavailable(String)
-        case serviceRequiresSSL
         case notConnected
         case transport(String)
 
@@ -48,35 +53,31 @@ actor LocationSimulatorService {
                 return "lockdownd-handshake mislukt: \(message)"
             case .serviceUnavailable(let message):
                 return "simulatelocation-service niet beschikbaar: \(message)"
-            case .serviceRequiresSSL:
-                return "De service vereist SSL; dat valt buiten deze minimale handshake."
             case .notConnected:
-                return "Er is geen open simulatelocation-kanaal. Roep eerst connectToLockdownd(port:) aan."
+                return "Er is geen open simulatelocation-kanaal. Roep eerst connectToLockdownd(...) aan."
             case .transport(let message):
                 return message
             }
         }
     }
 
-    /// Commandowoorden van het simulatelocation-protocol.
     private enum Command: UInt32 {
         case set = 0   // coördinaten volgen hierna
         case stop = 1  // simulatie beëindigen, geen payload
     }
 
     private static let serviceName = "com.apple.dt.simulatelocation"
-    private static let defaultLockdownPort = 62078
+    private static let lockdownPort = 62078
 
     private let host: String
-    private var service: TCPConnection?
+    private var service: SocketChannel?
     private let logger = Logger(subsystem: TunnelConstants.loggingSubsystem, category: "LocationSimulator")
 
-    /// - Parameter host: standaard het loopback-adres uit Module 1.
+    /// - Parameter host: het Wi-Fi-IP van het toestel, of het loopback-adres uit
+    ///   Module 1 wanneer het verkeer daarheen wordt gerouteerd.
     init(host: String = TunnelConstants.serverAddress) {
         self.host = host
     }
-
-    // MARK: - Publieke status
 
     var isConnected: Bool { service != nil }
 
@@ -85,25 +86,18 @@ actor LocationSimulatorService {
     /// Opent het kanaal voor locatiecommando's:
     /// 1. verbindt met lockdownd,
     /// 2. controleert het servicetype via `QueryType`,
-    /// 3. laat lockdownd `com.apple.dt.simulatelocation` starten,
-    /// 4. verbindt met de teruggegeven servicepoort.
-    ///
-    /// Na afloop staat het servicekanaal open en kan `sendSimulateLocation` volgen.
-    func connectToLockdownd(port: Int = LocationSimulatorService.defaultLockdownPort) async throws {
-        disconnect() // schone lei
+    /// 3. start een sessie met de pairing record en upgradet naar TLS,
+    /// 4. laat lockdownd `com.apple.dt.simulatelocation` starten,
+    /// 5. verbindt met de servicepoort (met TLS als de service dat vraagt).
+    func connectToLockdownd(pairingRecord: PairingRecord,
+                            port: Int = LocationSimulatorService.lockdownPort) async throws {
+        disconnect()
 
         guard port > 0, port <= Int(UInt16.max) else {
             throw LocationSimulatorError.invalidPort(port)
         }
 
-        let lockdown: LockdownClient
-        do {
-            let lockdownConnection = try TCPConnection(host: host, port: UInt16(port))
-            lockdown = LockdownClient(connection: lockdownConnection)
-        } catch {
-            throw mapTransport(error)
-        }
-
+        let lockdown = LockdownClient(channel: SocketChannel(host: host, port: UInt16(port)))
         do {
             try await lockdown.open()
 
@@ -112,16 +106,21 @@ actor LocationSimulatorService {
                 throw LocationSimulatorError.handshakeFailed("onverwacht type '\(type)'")
             }
 
+            try await lockdown.startSession(pairingRecord: pairingRecord)
             let descriptor = try await lockdown.startService(Self.serviceName)
+            try await lockdown.stopSession()
             lockdown.close()
 
-            guard !descriptor.sslEnabled else {
-                throw LocationSimulatorError.serviceRequiresSSL
+            let serviceChannel = SocketChannel(host: host, port: descriptor.port)
+            try await serviceChannel.connect()
+            if descriptor.sslEnabled {
+                let credentials = TLSCredentials(
+                    identity: try pairingRecord.makeClientIdentity(),
+                    pinnedCertificateDER: pairingRecord.deviceCertificateDER
+                )
+                try await serviceChannel.startTLS(credentials: credentials)
             }
-
-            let serviceConnection = try TCPConnection(host: host, port: descriptor.port)
-            try await serviceConnection.open()
-            service = serviceConnection
+            service = serviceChannel
             logger.log("simulatelocation-kanaal open op poort \(descriptor.port, privacy: .public).")
         } catch {
             lockdown.close()
@@ -130,16 +129,28 @@ actor LocationSimulatorService {
         }
     }
 
+    /// Gemaksvariant die de pairing record uit een bestand inleest.
+    func connectToLockdownd(pairingRecordURL: URL,
+                            port: Int = LocationSimulatorService.lockdownPort) async throws {
+        let record: PairingRecord
+        do {
+            record = try PairingRecord(url: pairingRecordURL)
+        } catch {
+            throw map(error)
+        }
+        try await connectToLockdownd(pairingRecord: record, port: port)
+    }
+
     // MARK: - Locatie versturen
 
     /// Zet de gesimuleerde locatie van het toestel.
     ///
-    /// Wire-formaat: `Command.set` (4 bytes, big-endian) gevolgd door de
-    /// breedte- en lengtegraad, elk als lengte-geprefixte ASCII-string.
+    /// Wire-formaat: `Command.set` (4 bytes, big-endian) gevolgd door de breedte-
+    /// en lengtegraad, elk als lengte-geprefixte ASCII-string.
     func sendSimulateLocation(latitude: Double, longitude: Double) async throws {
-        guard (-90.0...90.0).contains(latitude),
-              (-180.0...180.0).contains(longitude),
-              latitude.isFinite, longitude.isFinite else {
+        guard latitude.isFinite, longitude.isFinite,
+              (-90.0...90.0).contains(latitude),
+              (-180.0...180.0).contains(longitude) else {
             throw LocationSimulatorError.invalidCoordinate(latitude: latitude, longitude: longitude)
         }
         guard let service else { throw LocationSimulatorError.notConnected }
@@ -152,8 +163,8 @@ actor LocationSimulatorService {
             try await service.send(payload)
             logger.log("Locatie gezet op \(latitude, privacy: .public), \(longitude, privacy: .public).")
         } catch {
-            disconnect() // sluit de socket bij een verzendfout
-            throw mapTransport(error)
+            disconnect()
+            throw map(error)
         }
     }
 
@@ -165,18 +176,8 @@ actor LocationSimulatorService {
             logger.log("Locatiesimulatie gestopt.")
         } catch {
             disconnect()
-            throw mapTransport(error)
+            throw map(error)
         }
-    }
-
-    /// Handige combinatie: handshake, locatie zetten, kanaal open laten.
-    func simulate(latitude: Double,
-                  longitude: Double,
-                  lockdownPort: Int = LocationSimulatorService.defaultLockdownPort) async throws {
-        if service == nil {
-            try await connectToLockdownd(port: lockdownPort)
-        }
-        try await sendSimulateLocation(latitude: latitude, longitude: longitude)
     }
 
     /// Sluit het servicekanaal. Idempotent; wordt ook automatisch aangeroepen bij fouten.
@@ -208,19 +209,16 @@ actor LocationSimulatorService {
 
     // MARK: - Foutafbeelding
 
-    private func map(_ error: Error) -> Error {
-        if error is LocationSimulatorError { return error }
-        return mapTransport(error)
-    }
-
-    private func mapTransport(_ error: Error) -> LocationSimulatorError {
+    private func map(_ error: Error) -> LocationSimulatorError {
         switch error {
         case let simulatorError as LocationSimulatorError:
             return simulatorError
-        case let connectionError as TCPConnection.ConnectionError:
-            return .transport(connectionError.localizedDescription)
+        case let channelError as SocketChannel.ChannelError:
+            return .transport(channelError.localizedDescription)
         case let lockdownError as LockdownClient.LockdownError:
             return .serviceUnavailable(lockdownError.localizedDescription)
+        case let pairingError as PairingRecord.ParseError:
+            return .handshakeFailed(pairingError.localizedDescription)
         default:
             return .transport(error.localizedDescription)
         }
