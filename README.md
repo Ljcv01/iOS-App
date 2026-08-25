@@ -91,3 +91,68 @@ wordt wél gebruikt als `tunnelRemoteAddress` en als `serverAddress` in Instelli
   achter een `NSLock`.
 * Log-output bekijk je met Console.app, gefilterd op subsystem
   `com.example.iOSApp.tunnel`.
+
+---
+
+# Module 2 — Communicatieprotocol (`LocationSimulatorService`)
+
+Een Swift 6-compliant client die het `com.apple.dt.simulatelocation`-protocol van
+Apple spreekt over een TCP-socket, opgezet met `Network.framework` (`NWConnection`)
+richting `127.0.0.1` (uit `TunnelConstants`).
+
+### Bestanden (`Services/`)
+
+| Bestand | Rol |
+| --- | --- |
+| `Services/TCPConnection.swift` | Async/await-schil rond `NWConnection`: `open`, `send`, `receive(exactly:)`, `close` |
+| `Services/LockdownClient.swift` | Minimale lockdownd-client: plist-berichten met 4-byte big-endian lengte-prefix, `QueryType` + `StartService` |
+| `Services/LocationSimulatorService.swift` | `actor` met `connectToLockdownd(port:)`, `sendSimulateLocation(latitude:longitude:)`, `stopSimulation()`, `simulate(...)`, `disconnect()` |
+| `Tests/LocationSimulatorEncodingTests.swift` | Swift Testing-dekking voor de wire-encoding |
+
+### Belangrijk: haalbaarheid
+
+`com.apple.dt.simulatelocation` en `lockdownd` zijn **host-side** protocollen. Ze
+draaien op het toestel maar worden vanaf een *computer* aangesproken via usbmux/USB
+(zoals Xcode en libimobiledevice doen). Een gesandboxte iOS-app die op het toestel
+zelf draait kan `lockdownd` **niet** bereiken via `127.0.0.1` — ook niet via de
+tunnel uit Module 1, want die vangt IP-pakketten, terwijl simulatelocation over het
+usbmux/lockdown-kanaal loopt (geen bereikbare IP-service).
+
+Deze code is een **correcte client voor het protocol**. Hij werkt zodra er echt een
+lockdownd-endpoint op de opgegeven poort luistert (een host-context, een relay die
+de tunnel doorstuurt, of een jailbreak-omgeving). Op een standaard toestel vanuit de
+app-sandbox zal de verbinding worden geweigerd (`.transport(...)`-fout).
+
+### Wire-formaat
+
+Het echte simulatelocation-protocol stuurt de coördinaten als **lengte-geprefixte
+ASCII-strings**, voorafgegaan door een 4-byte big-endian commandowoord:
+
+```
+[ command : uint32 BE ]        0 = locatie zetten, 1 = simulatie stoppen
+[ len : uint32 BE ][ latitude  ASCII ]
+[ len : uint32 BE ][ longitude ASCII ]
+```
+
+Dit is exact wat `idevicesetlocation` doet. De in de opdracht genoemde big-endian
+IEEE-754 double-serialisatie zit als herbruikbare helper in `Double.bigEndianBytes`,
+maar het simulatelocation-kanaal zelf gebruikt strings, geen doubles.
+
+### Gebruik
+
+```swift
+let simulator = LocationSimulatorService()          // host: 127.0.0.1
+
+try await simulator.connectToLockdownd()            // QueryType + StartService
+try await simulator.sendSimulateLocation(latitude: 37.7749, longitude: -122.4194)
+// … later:
+try await simulator.stopSimulation()
+await simulator.disconnect()
+
+// Of in één keer:
+try await simulator.simulate(latitude: 52.3676, longitude: 4.9041)
+```
+
+De `NWConnection` wordt automatisch gesloten bij elke verzend-/verbindingsfout en
+bij `disconnect()`. `LocationSimulatorService` is een `actor`, dus de socket-state
+wordt serieel en Swift 6-veilig beheerd.
