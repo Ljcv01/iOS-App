@@ -327,8 +327,10 @@ final class VPNManager: ObservableObject {
         proto.serverAddress = TunnelConstants.serverAddress
         proto.providerConfiguration = configuration.dictionaryRepresentation
         proto.disconnectOnSleep = false
-        // Verkeer binnen het lokale netwerk (AirPrint, AirPlay) buiten de tunnel houden.
-        proto.excludeLocalNetworks = true
+        // NIET `excludeLocalNetworks` zetten: het tunnel-subnet (10.7.0.0/24) is
+        // zelf een privé-netwerk, dus die vlag zou precies het verkeer uitsluiten
+        // dat door de tunnel moet. De provider routeert al alleen dat ene subnet.
+        proto.excludeLocalNetworks = false
 
         manager.protocolConfiguration = proto
         manager.localizedDescription = TunnelConstants.localizedDescription

@@ -9,7 +9,11 @@
 
 import Testing
 import Foundation
-@testable import Services
+
+// Vervang dit door de modulenaam van je app-target (Build Settings →
+// Product Module Name). In een Xcode-app-project zit `Services/` in het
+// app-target, niet in een eigen module.
+@testable import iOSApp
 
 struct PairingRecordTests {
 

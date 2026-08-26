@@ -1,233 +1,177 @@
-# Lokale Packet Tunnel (iOS 26)
+# On-device Location Simulator (iOS 17.4+ / iOS 26)
 
-Een volledig lokale `NEPacketTunnelProvider`: er wordt een virtuele IPv4-interface
-(utun) opgezet met een default route, zodat al het IPv4-verkeer van het toestel de
-tunnel in gaat. Het remote adres van de tunnel is `127.0.0.1`. Er wordt **geen enkele
-socket geopend en geen enkel extern netwerkverzoek gedaan** — de extensie importeert
-alleen `NetworkExtension`, `Foundation` en `os`.
+Een iOS-app die de **systeembrede** GPS-locatie van het toestel zelf simuleert,
+zonder dat er een computer aan hangt tijdens gebruik. De architectuur volgt het
+bewezen model van [StikDebug](https://github.com/StikDebug/StikDebug) en
+[SideStore](https://github.com/SideStore/StosVPN): een lokale loopback-VPN plus
+een pairing file, waarmee de app de developer-services van het toestel bereikt.
+
+> **Eén keer via een pc, daarna maandenlang los.** De pc-stap (pairing file +
+> Developer Disk Image mounten) is per toestel eenmalig en blijft geldig tot een
+> herstart. Daarna werkt de app zelfstandig.
+
+---
+
+## Hoe het werkt
+
+```
+   app ──▶ 10.7.0.1:49152                    (RemotePairing)
+            │
+            ▼
+   PacketTunnelProvider  ── NAT-hairpin ──▶  10.7.0.0  (het toestel zelf)
+            │
+            ▼
+   tunnel_create_rppairing   (pairing file → versleutelde tunnel)
+            │
+            ▼
+   remote_server_connect_rsd (DVT over RemoteServiceDiscovery)
+            │
+            ▼
+   location_simulation_set(lat, lon)
+```
+
+De VPN leidt géén internetverkeer om. Hij maakt alleen het toestel bereikbaar op
+een netwerk-adres: verkeer naar `10.7.0.1` wordt door de provider teruggekaatst
+naar de eigen interface (`10.7.0.0`), zodat het voor iOS lijkt alsof een *andere
+host* in hetzelfde subnet verbinding maakt. De developer-services accepteren dat
+wel, een loopback-verbinding niet.
+
+**Waarom poort 49152 en niet 62078?** Sinds iOS 17 zitten de developer-services
+achter RemoteServiceDiscovery op de RemotePairing-poort. De klassieke
+lockdownd-poort 62078 levert `com.apple.dt.simulatelocation` niet meer op.
+
+---
 
 ## Bestanden
 
 | Bestand | Target | Rol |
 | --- | --- | --- |
-| `Shared/TunnelConstants.swift` | app + extensie | Bundle-identifiers en berichtnamen |
-| `Shared/TunnelConfiguration.swift` | app + extensie | Instellingen die via `providerConfiguration` worden doorgegeven |
-| `Shared/TunnelStatistics.swift` | app + extensie | Tellers die de extensie terugstuurt |
-| `PacketTunnel/PacketTunnelProvider.swift` | extensie | De provider zelf |
-| `PacketTunnel/PacketRelay.swift` | extensie | Leeslus en pakketverwerking |
-| `PacketTunnel/IPv4Packet.swift` | extensie | IPv4-parsing, checksums, ICMP echo reply |
-| `App/VPNManager.swift` | app | `ObservableObject` rondom `NETunnelProviderManager` |
-| `App/VPNControlView.swift` | app | Voorbeeld-UI |
-| `Tests/IPv4PacketTests.swift` | tests | Swift Testing-tests voor de pakketlogica |
+| `Shared/TunnelConstants.swift` | app + extensie | Identifiers, adressen, poort |
+| `Shared/TunnelConfiguration.swift` | app + extensie | Instellingen via `providerConfiguration` |
+| `Shared/TunnelStatistics.swift` | app + extensie | Diagnostiek-tellers |
+| `PacketTunnel/PacketTunnelProvider.swift` | extensie | Netwerkinstellingen van de tunnel |
+| `PacketTunnel/PacketRelay.swift` | extensie | De NAT-hairpin |
+| `Services/IdeviceLocationClient.swift` | app | Swift-schil rond de idevice-FFI |
+| `Services/PairingRecord.swift` + `PEM.swift` | app | Validatie van het pairing-bestand |
+| `App/VPNManager.swift` | app | `NETunnelProviderManager`-beheer |
+| `App/SpoofingViewModel.swift` | app | De keten: VPN → tunnel → locatie |
+| `App/ContentView.swift` | app | Kaart, importer, badges, knop |
+| `App/VPNControlView.swift` | app | Diagnostiek-view |
 
-## Opzet in Xcode
+---
 
-1. Voeg aan je app-project een target toe: **File ▸ New ▸ Target… ▸ Network Extension**,
-   en kies **Packet Tunnel** als extensietype. Noem het target bijvoorbeeld `PacketTunnel`.
-2. Zet in beide targets de capability **Network Extensions ▸ Packet Tunnel** aan
-   (`com.apple.developer.networking.networkextension` met `packet-tunnel-provider`).
-   Deze entitlement vereist een betaald Apple Developer-account; App Groups zijn optioneel.
-3. Vervang in `Shared/TunnelConstants.swift` de identifiers door je eigen bundle-ids.
-   `providerBundleIdentifier` moet exact gelijk zijn aan de `PRODUCT_BUNDLE_IDENTIFIER`
-   van het extensie-target, anders weigert het systeem de provider te starten.
+## Setup
+
+### 1. idevice inbouwen
+
+De app leunt op [`jkcoxson/idevice`](https://github.com/jkcoxson/idevice) (MIT).
+Die levert de RemotePairing-tunnel, RSD/RemoteXPC en de locatie-API — duizenden
+regels protocol- en cryptocode die je niet met de hand wilt naschrijven.
+
+1. Download `idevice-xcframework-<versie>.zip` van de
+   [releases](https://github.com/jkcoxson/idevice/releases) (v0.1.66 of nieuwer).
+2. Pak uit en sleep het xcframework in je Xcode-project
+   (**Target → General → Frameworks, Libraries, and Embedded Content**).
+3. Controleer dat `import idevice` werkt. Lukt dat niet, gebruik dan de aanpak
+   van StikDebug: leg `idevice.h`, `libidevice_ffi.a` en een `module.modulemap`
+   in een map en zet die map in **Build Settings → Swift Compiler → Import Paths**
+   (`SWIFT_INCLUDE_PATHS`) én in **Library Search Paths**. De modulemap is:
+
+   ```
+   module idevice [system] {
+     header "idevice.h"
+     export *
+   }
+   ```
+
+Zonder de bibliotheek compileert het project gewoon door
+(`#if canImport(idevice)`), maar meldt de app netjes dat idevice ontbreekt.
+
+### 2. Network Extension target
+
+1. **File ▸ New ▸ Target… ▸ Network Extension**, type **Packet Tunnel**, naam `PacketTunnel`.
+2. Capability **Network Extensions ▸ Packet Tunnel** aan in *beide* targets.
+3. Vervang de identifiers in `Shared/TunnelConstants.swift` door je eigen bundle-ids.
+   `providerBundleIdentifier` moet exact de `PRODUCT_BUNDLE_IDENTIFIER` van het
+   extensie-target zijn.
 4. Target membership:
    - `Shared/*.swift` → **app én extensie**
    - `PacketTunnel/*.swift` → alleen de **extensie**
-   - `App/*.swift` → alleen de **app**
-5. Zorg dat het extensie-target `PacketTunnel/Info.plist` gebruikt, met
-   `NSExtensionPointIdentifier` = `com.apple.networkextension.packet-tunnel` en
-   `NSExtensionPrincipalClass` = `$(PRODUCT_MODULE_NAME).PacketTunnelProvider`.
+   - `App/*.swift` en `Services/*.swift` → alleen de **app**
+5. Extensie-target gebruikt `PacketTunnel/Info.plist`.
 
-## Gebruik
+### 3. De eenmalige pc-stap
 
-```swift
-@StateObject private var vpn = VPNManager()
+Op een Mac of pc, met het toestel aangesloten en ontgrendeld:
 
-// Bij het verschijnen van je view: bestaand profiel inlezen.
-await vpn.refresh()
+```bash
+# Pairing file maken
+pymobiledevice3 lockdown pair
+# of: idevice_pair  (https://github.com/jkcoxson/idevice_pair)
 
-// Is het profiel al door de gebruiker geïnstalleerd?
-if vpn.isProfileInstalled { … }
+# Developer Mode aanzetten (eenmalig per toestel)
+pymobiledevice3 amfi enable-developer-mode
 
-// Installeren (toont de systeemvraag "VPN-configuraties toevoegen?").
-try await vpn.installProfile()
-
-// In- en uitschakelen.
-try await vpn.start()
-vpn.stop()
-
-// Status volgen: `vpn.status` is @Published en volgt NEVPNStatusDidChange.
+# Developer Disk Image mounten — op iOS 17+ gepersonaliseerd via Apple's servers
+pymobiledevice3 mounter auto-mount
 ```
 
-## Wat de tunnel met verkeer doet
+Zet de pairing file daarna op je toestel (AirDrop, Bestanden, iCloud Drive).
 
-* Alle IPv4-pakketten worden gelezen via `packetFlow.readPackets`.
-* ICMP echo requests (ping) worden **lokaal in de extensie beantwoord**: bron- en
-  bestemmingsadres worden omgedraaid, beide checksums worden herberekend en het
-  antwoord gaat via `packetFlow.writePackets` terug de interface in. Zo kun je met
-  `ping` aantonen dat het verkeer door de tunnel loopt zonder dat er iets naar buiten gaat.
-* Al het overige verkeer (TCP, UDP, DNS) wordt geteld en verworpen. De tunnel is een sink:
-  verbindingen naar buiten lopen bewust dood. Zet `capturesDNS` op `false` in
-  `TunnelConfiguration` als je DNS ongemoeid wilt laten.
-* IPv6 wordt niet geconfigureerd, dus er ontstaat uitsluitend een IPv4-interface.
+> De DDI-mount blijft geldig **tot de volgende herstart** van het toestel.
+> Herhaal `mounter auto-mount` na een reboot.
 
-## Adreskeuze
+### 4. Gebruiken
 
-De interface krijgt `198.18.0.1/24` (RFC 2544, gereserveerd voor benchmarking, botst dus
-niet met echte netwerken van de gebruiker). `127.0.0.1` kan hier niet als interface-adres
-gebruikt worden — iOS weigert een loopback-adres op een utun-interface. Het loopback-adres
-wordt wél gebruikt als `tunnelRemoteAddress` en als `serverAddress` in Instellingen.
-
-## Aandachtspunten
-
-* De extensie draait **niet** in de Simulator; test op een fysiek toestel.
-* Na `saveToPreferences()` altijd `loadFromPreferences()` aanroepen vóór het starten,
-  anders krijg je `NEVPNError.configurationInvalid`.
-* Weigert de gebruiker de systeemvraag, dan komt dat terug als
-  `NEVPNError.configurationReadWriteFailed`; `VPNManager` vertaalt dat naar
-  `VPNError.permissionDenied`.
-* De code is geschreven met strict concurrency in het achterhoofd: de provider vangt
-  in geen enkele escaping closure `self`, en gedeelde state zit in `Sendable` types
-  achter een `NSLock`.
-* Log-output bekijk je met Console.app, gefilterd op subsystem
-  `com.example.iOSApp.tunnel`.
+1. Start de app, importeer de pairing file met de knop rechtsboven.
+2. Tik een doel op de kaart.
+3. **Start Spoofing** — de app zet de VPN aan, bouwt de tunnel op en zet de locatie.
+4. Tik daarna gerust een nieuw punt: de sessie blijft open, dus dat gaat instant.
 
 ---
 
-# Module 2 — Lockdown & Protocol Service
+## Troubleshooting
 
-Een Swift 6-compliant client die zich met een **pairing record** bij lockdownd
-authenticeert, de verbinding naar **TLS** upgradet en daarna het
-`com.apple.dt.simulatelocation`-protocol spreekt.
-
-### Bestanden (`Services/`)
-
-| Bestand | Rol |
+| Symptoom | Oorzaak / oplossing |
 | --- | --- |
-| `Services/PEM.swift` | PEM ↔ DER-helper voor de certificaten/sleutels uit de pairing record |
-| `Services/PairingRecord.swift` | Parser voor de `.plist`/`.bplist` pairing record; bouwt de client-`SecIdentity` en pint het device-certificaat |
-| `Services/SocketChannel.swift` | Rauwe POSIX-socket met Secure Transport (`SSLContext`) STARTTLS-upgrade midden in de stream |
-| `Services/LockdownClient.swift` | lockdownd-handshake: `QueryType` → `StartSession` → TLS → `StartService` |
-| `Services/LocationSimulatorService.swift` | `actor` met `connectToLockdownd(pairingRecord:port:)`, `sendSimulateLocation(latitude:longitude:)`, `stopSimulation()`, `disconnect()` |
-| `Tests/LocationSimulatorEncodingTests.swift` | Wire-encoding + big-endian double-helper |
-| `Tests/PairingRecordTests.swift` | PEM-decode en pairing-record-parsing |
+| "Kon geen verbinding maken met de developer-services" | De DDI is niet gemount. Doe stap 3 opnieuw (meestal na een reboot). |
+| "Address already in use" | Een andere JIT-/debug-/VPN-app gebruikt de poort. Sluit die, herstart de VPN. |
+| "Connection reset" | VPN niet verbonden, of doeladres klopt niet. Controleer `10.7.0.1`. |
+| "Timed out" | Toestel vergrendeld, of Wi-Fi/VPN uit. |
+| Pairing-fouten | Maak een verse pairing file met het toestel ontgrendeld en vertrouwd. |
+| `Omgeleid (hairpin)` blijft 0 | Verkeer bereikt de tunnel niet — controleer routering en doeladres. |
 
-### Waarom een rauwe socket en niet `NWConnection`
-
-Lockdown doet eerst een **plaintext** `StartSession` en upgradet daarna *dezelfde*
-socket naar TLS (STARTTLS-stijl). `NWConnection` kan geen TLS starten midden in een
-bestaande stream — daar moet TLS bij het opzetten al vaststaan. De enige manier die
-op iOS wél een in-stream upgrade doet, is een rauwe POSIX-socket met **Secure
-Transport** (`SSLContext` + `SSLSetIOFuncs`) eroverheen; dat is ook wat de
-libimobiledevice-poorten op Apple-platforms doen. `SSLContext` is deprecated maar
-functioneel. De client-identity komt uit de pairing record; de peer wordt gepind op
-het `DeviceCertificate` in plaats van via keten-validatie (het zijn
-zelfondertekende certificaten).
-
-### Handshake-sequentie
-
-```
-verbind (plaintext) ──▶ QueryType            (verwacht com.apple.mobile.lockdown)
-                    ──▶ StartSession          (HostID + SystemBUID uit de pairing record)
-                    ──▶ TLS-upgrade           (als EnableSessionSSL: client-cert + pin)
-                    ──▶ StartService           (com.apple.dt.simulatelocation → poort)
-        nieuw kanaal ──▶ (TLS als EnableServiceSSL) ──▶ locatiecommando's
-```
-
-### Wire-formaat
-
-Het simulatelocation-protocol stuurt de coördinaten als **lengte-geprefixte
-ASCII-strings**, voorafgegaan door een 4-byte big-endian commandowoord:
-
-```
-[ command : uint32 BE ]        0 = locatie zetten, 1 = simulatie stoppen
-[ len : uint32 BE ][ latitude  ASCII ]
-[ len : uint32 BE ][ longitude ASCII ]
-```
-
-Dit is exact wat `idevicesetlocation` doet. De in de opdracht genoemde big-endian
-IEEE-754 double-serialisatie zit als herbruikbare helper in `Double.bigEndianBytes`,
-maar het simulatelocation-kanaal zelf gebruikt strings, geen doubles.
-
-### Gebruik
-
-```swift
-let simulator = LocationSimulatorService(host: "127.0.0.1")   // of het Wi-Fi-IP van het toestel
-
-// Pairing record via .fileImporter (Module 4) of uit de app-bundle:
-try await simulator.connectToLockdownd(pairingRecordURL: url)
-try await simulator.sendSimulateLocation(latitude: 52.3676, longitude: 4.9041)
-// … later:
-try await simulator.stopSimulation()
-await simulator.disconnect()
-```
-
-De socket wordt automatisch gesloten bij elke verzend-/verbindings-/TLS-fout en bij
-`disconnect()`. `LocationSimulatorService` is een `actor`, en `SocketChannel`
-serialiseert alle fd/TLS-toegang op één queue — Swift 6-veilig.
-
-### Belangrijk: haalbaarheid
-
-`com.apple.dt.simulatelocation` vereist dat de Developer Disk Image gemount is. Op
-iOS 17+ is dat een **gepersonaliseerde DDI** die vooraf via een PC/Mac gemount moet
-zijn (Module 3 is daarom geschrapt), en zijn developer-services bovendien verhuisd
-naar **RemoteServiceDiscovery**. lockdownd en simulatelocation zijn van oorsprong
-host-side (usbmux) protocollen. Deze client implementeert het **klassieke
-lockdown-pad** correct — inclusief de pairing-TLS-upgrade — en is bedoeld als
-educatieve/functionele re-implementatie. Of hij op een concreet toestel/iOS-versie
-daadwerkelijk een locatie zet, hangt af van of dat pad daar beschikbaar is gemaakt.
-
-> Deze code is niet gecompileerd of tegen een fysiek toestel getest in deze omgeving
-> (geen Swift-toolchain aanwezig). De low-level Secure Transport- en keychain-paden
-> zijn zorgvuldig geschreven volgens de betreffende API's, maar device-specifieke
-> TLS-parameters kunnen tuning vereisen.
+Logs bekijk je in Console.app, gefilterd op subsystem `com.example.iOSApp.tunnel`.
 
 ---
 
-# Module 4 — SwiftUI-frontend
+## Belangrijke aandachtspunten
 
-Een moderne iOS 17+-interface (getest tegen iPhone 17 Pro Max / iOS 26.5.2) die de
-modules aan elkaar knoopt.
+- **De extensie draait niet in de Simulator.** Test op een fysiek toestel.
+- **Sideload/TestFlight nodig.** De Network Extension-entitlement vereist een
+  Apple Developer-account; distributie via de App Store is voor dit type app
+  niet realistisch.
+- **Niet `excludeLocalNetworks` aanzetten.** Het tunnel-subnet is zelf een
+  privé-netwerk; die vlag zou precies het verkeer blokkeren dat door de tunnel moet.
+- **Geen checksums herberekenen in de hairpin.** De bewezen implementaties doen
+  dat ook niet: op een utun-interface worden checksums van geïnjecteerde pakketten
+  niet gevalideerd. "Verbeteren" breekt het juist.
+- **Na `saveToPreferences()` altijd `loadFromPreferences()`** vóór het starten,
+  anders `NEVPNError.configurationInvalid`.
+- **iOS 17.4+ vereist.** Daaronder gelden andere connectieprotocollen. idevice
+  biedt daarvoor `lockdown_location_simulation_*` (het klassieke pad), maar dat
+  is in deze app niet ingebouwd.
 
-### Bestanden (`App/`)
+## Status
 
-| Bestand | Rol |
-| --- | --- |
-| `App/ContentView.swift` | Kaart, `.fileImporter`, status-badges en de 'Start Spoofing'-knop |
-| `App/SpoofingViewModel.swift` | `@MainActor ObservableObject` die de keten orkestreert (VPN → pairing/TLS → coördinaten) |
+De code is geschreven tegen de geverifieerde FFI-signaturen uit `idevice.h`
+(v0.1.66) en volgt de werkende referentie-implementatie van StikDebug. Hij is in
+deze omgeving **niet gecompileerd en niet op een toestel getest** — er was geen
+Swift-toolchain of iPhone beschikbaar. Reken op bijstellen bij de eerste build.
 
-### Wat de UI doet
+## Credits
 
-- **Kaart** — moderne MapKit `Map` binnen een `MapReader`; een tik wordt via
-  `proxy.convert(_:from:)` omgezet naar een `CLLocationCoordinate2D` en getoond als
-  rode `Marker`. Tikken terwijl de simulatie actief is, verplaatst de gesimuleerde
-  locatie meteen.
-- **Pairing File** — `.fileImporter` voor het `.bplist` bestand. Het bestand wordt
-  binnen security-scoped toegang ingelezen en direct als `PairingRecord`
-  gevalideerd, zodat fouten meteen zichtbaar zijn.
-- **Status-badges** — VPN-status (uit `VPNManager`, Module 1) en protocol-status
-  (uit de keten-fase, Module 2), met kleur die de toestand volgt.
-- **Host-veld** — standaard `127.0.0.1` (via de tunnel), of het Wi-Fi-IP van het
-  toestel.
-- **Start Spoofing** — draait de keten asynchroon:
-  1. `VPNManager.start()` en wachten tot de tunnel `.connected` is (met time-out),
-  2. `LocationSimulatorService.connectToLockdownd(pairingRecord:)` (lockdown + TLS),
-  3. `sendSimulateLocation(latitude:longitude:)`.
-  De knop wordt 'Stop Spoofing' zodra de locatie actief is en zet alles weer terug.
-- **Foutafhandeling** — elke fase-fout landt in een `Alert` met een leesbare
-  beschrijving; de keten sluit het kanaal netjes af.
-
-### Wiring
-
-Zet `ContentView` als root:
-
-```swift
-@main
-struct LocationSimulatorApp: App {
-    var body: some Scene { WindowGroup { ContentView() } }
-}
-```
-
-Target membership: `App/*.swift` hoort bij de **app**, samen met `Shared/*.swift` en
-`Services/*.swift`. (`Services/` heeft geen `NetworkExtension` nodig en draait in het
-app-proces.)
+- [jkcoxson/idevice](https://github.com/jkcoxson/idevice) — MIT
+- [StikDebug](https://github.com/StikDebug/StikDebug) — referentie-implementatie
+- [SideStore/StosVPN](https://github.com/SideStore/StosVPN) — het hairpin-model
+- [pymobiledevice3](https://github.com/doronz88/pymobiledevice3) — de pc-stap

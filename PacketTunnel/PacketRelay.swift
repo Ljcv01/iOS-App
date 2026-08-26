@@ -2,12 +2,23 @@
 //  PacketRelay.swift
 //  PacketTunnel
 //
-//  Leest pakketten van de virtuele interface en verwerkt ze volledig lokaal.
-//  Er wordt nooit een socket geopend en er gaat nooit iets naar buiten.
+//  Kaatst IPv4-verkeer terug naar het toestel zelf (een NAT-hairpin), zodat de
+//  app de systeemservices van het toestel kan bereiken via een adres dat er
+//  voor iOS uitziet als een externe host in hetzelfde subnet.
 //
-//  De relay is een los, thread-safe object (en dus `Sendable`), zodat de
-//  provider zelf geen `self` hoeft mee te geven aan escaping closures. Dat
-//  houdt de code schoon onder strict concurrency van Swift 6.
+//      app  ──▶  dst = 10.7.0.1 (peer)        src = 10.7.0.0 (device)
+//      relay ──▶ dst = 10.7.0.0 (device)      src = 10.7.0.1 (peer)
+//      → het pakket komt binnen op de eigen interface, ogenschijnlijk van een
+//        andere host, en de developer-services accepteren de verbinding.
+//
+//  Dit is dezelfde techniek als StosVPN / LocalDevVPN, de tunnels waar
+//  StikDebug en SideStore op draaien.
+//
+//  Er wordt bewust GEEN checksum herberekend. Dat klinkt fout, maar de
+//  bewezen implementaties doen het ook niet: op een utun-interface worden de
+//  IP/TCP-checksums van geïnjecteerde pakketten niet gevalideerd. Ga hier niet
+//  "verbeteren" — checksums bijwerken zonder de TCP-pseudoheader mee te nemen
+//  breekt de verbinding juist.
 //
 
 import Foundation
@@ -17,7 +28,8 @@ import os
 final class PacketRelay: @unchecked Sendable {
 
     private let packetFlow: NEPacketTunnelFlow
-    private let configuration: TunnelConfiguration
+    private let deviceAddress: UInt32
+    private let peerAddress: UInt32
     private let logger: Logger
 
     private let lock = NSLock()
@@ -26,7 +38,8 @@ final class PacketRelay: @unchecked Sendable {
 
     init(packetFlow: NEPacketTunnelFlow, configuration: TunnelConfiguration) {
         self.packetFlow = packetFlow
-        self.configuration = configuration
+        self.deviceAddress = Self.ipv4Value(configuration.deviceAddress)
+        self.peerAddress = Self.ipv4Value(configuration.peerAddress)
         self.logger = Logger(subsystem: TunnelConstants.loggingSubsystem, category: "PacketRelay")
     }
 
@@ -42,7 +55,7 @@ final class PacketRelay: @unchecked Sendable {
         }
         guard shouldStart else { return }
 
-        logger.log("Packet relay gestart; al het IPv4-verkeer wordt lokaal afgehandeld.")
+        logger.log("Packet relay gestart (hairpin actief).")
         scheduleRead()
     }
 
@@ -81,46 +94,64 @@ final class PacketRelay: @unchecked Sendable {
     }
 
     private func handle(packets: [Data], protocols: [NSNumber]) {
-        var replies: [Data] = []
-        var replyProtocols: [NSNumber] = []
+        let device = deviceAddress
+        let peer = peerAddress
 
-        var readCount = 0
-        var readBytes = 0
-        var dropped = 0
+        var rewritten = packets
+        var bytes = 0
+        var translated = 0
 
-        for (index, packet) in packets.enumerated() {
-            readCount += 1
-            readBytes += packet.count
+        for index in rewritten.indices {
+            bytes += rewritten[index].count
 
-            let family = index < protocols.count ? protocols[index].int32Value : AF_INET
-            guard family == AF_INET else {
-                // Alleen IPv4 wordt afgehandeld; IPv6 staat in de netwerkinstellingen uit.
-                dropped += 1
+            guard index < protocols.count,
+                  protocols[index].int32Value == AF_INET,
+                  rewritten[index].count >= 20 else {
                 continue
             }
 
-            if configuration.respondsToICMPEcho,
-               let reply = IPv4Packet.makeEchoReply(from: packet) {
-                replies.append(reply)
-                replyProtocols.append(NSNumber(value: AF_INET))
-            } else {
-                // Alle overige pakketten eindigen hier: de tunnel is een sink.
-                dropped += 1
+            // Bron staat op byte 12..15, bestemming op 16..19 — ook als de
+            // header opties bevat (IHL > 5).
+            let didTranslate = rewritten[index].withUnsafeMutableBytes { raw -> Bool in
+                guard let base = raw.baseAddress else { return false }
+                let words = base.assumingMemoryBound(to: UInt32.self)
+                var changed = false
+                if UInt32(bigEndian: words[3]) == device {
+                    words[3] = peer.bigEndian
+                    changed = true
+                }
+                if UInt32(bigEndian: words[4]) == peer {
+                    words[4] = device.bigEndian
+                    changed = true
+                }
+                return changed
             }
+            if didTranslate { translated += 1 }
         }
 
-        let writtenBytes = replies.reduce(0) { $0 + $1.count }
-        if !replies.isEmpty {
-            packetFlow.writePackets(replies, withProtocols: replyProtocols)
-        }
+        packetFlow.writePackets(rewritten, withProtocols: protocols)
 
         lock.withLock {
-            stats.packetsRead += readCount
-            stats.bytesRead += readBytes
-            stats.packetsDropped += dropped
-            stats.packetsWritten += replies.count
-            stats.bytesWritten += writtenBytes
-            stats.icmpEchoRepliesSent += replies.count
+            stats.packetsRead += packets.count
+            stats.bytesRead += bytes
+            stats.packetsWritten += rewritten.count
+            stats.bytesWritten += bytes
+            stats.packetsTranslated += translated
         }
+    }
+
+    // MARK: - Helpers
+
+    /// Zet een dotted-quad om naar een host-order `UInt32`. Geeft 0 terug bij
+    /// een ongeldig adres, wat simpelweg betekent dat er niets matcht.
+    static func ipv4Value(_ address: String) -> UInt32 {
+        let parts = address.split(separator: ".")
+        guard parts.count == 4 else { return 0 }
+        var value: UInt32 = 0
+        for part in parts {
+            guard let byte = UInt8(part) else { return 0 }
+            value = (value << 8) | UInt32(byte)
+        }
+        return value
     }
 }

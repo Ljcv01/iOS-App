@@ -133,11 +133,18 @@ struct ContentView: View {
         HStack(spacing: 10) {
             Image(systemName: model.hasPairingFile ? "checkmark.seal.fill" : "doc.questionmark")
                 .foregroundStyle(model.hasPairingFile ? .green : .secondary)
-            Text(model.pairingFileName ?? "Geen Pairing File geïmporteerd")
-                .font(.callout)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .foregroundStyle(model.hasPairingFile ? .primary : .secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(model.pairingFileName ?? "Geen Pairing File geïmporteerd")
+                    .font(.callout)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .foregroundStyle(model.hasPairingFile ? .primary : .secondary)
+                if let summary = model.pairingSummary {
+                    Text(summary)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+            }
             Spacer()
             Button("Kies") { showingImporter = true }
                 .font(.callout.weight(.semibold))
@@ -189,7 +196,7 @@ struct ContentView: View {
     private var buttonTitle: String {
         switch model.phase {
         case .startingVPN: return "VPN starten…"
-        case .pairing: return "Koppelen…"
+        case .connecting: return "Tunnel opzetten…"
         case .sending: return "Versturen…"
         case .active: return "Stop Spoofing"
         case .idle, .failed: return "Start Spoofing"

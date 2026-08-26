@@ -2,11 +2,14 @@
 //  PacketTunnelProvider.swift
 //  PacketTunnel
 //
-//  Volledig lokale NEPacketTunnelProvider. Er wordt een virtuele IPv4-interface
-//  (utun) opgezet met een default route, zodat al het IPv4-verkeer van het
-//  toestel de tunnel in wordt gestuurd. Het remote adres van de tunnel is
-//  127.0.0.1: er wordt geen enkele verbinding met een server opgezet en er
-//  verlaat geen byte het toestel.
+//  Loopback-tunnel volgens het StosVPN / LocalDevVPN-model. De virtuele
+//  IPv4-interface krijgt 10.7.0.0/24 en ALLEEN dat subnet wordt de tunnel in
+//  gerouteerd — de default route wordt expliciet uitgesloten, zodat je normale
+//  internetverkeer ongemoeid blijft.
+//
+//  Verkeer naar 10.7.0.1 wordt door `PacketRelay` teruggekaatst naar het
+//  toestel zelf, waardoor de app de developer-services van het toestel kan
+//  bereiken (RemotePairing op poort 49152).
 //
 
 import Foundation
@@ -45,13 +48,23 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     override func startTunnel(options: [String: NSObject]?,
                               completionHandler: @escaping (Error?) -> Void) {
-        let providerConfiguration = (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration
-        let configuration = TunnelConfiguration(providerConfiguration: providerConfiguration)
+        var configuration = TunnelConfiguration(
+            providerConfiguration: (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration
+        )
+
+        // Opties uit `startVPNTunnel(options:)` winnen van de opgeslagen configuratie.
+        if let value = options?[TunnelConfiguration.Key.deviceAddress] as? NSString {
+            configuration.deviceAddress = value as String
+        }
+        if let value = options?[TunnelConfiguration.Key.peerAddress] as? NSString {
+            configuration.peerAddress = value as String
+        }
+
         let settings = Self.makeNetworkSettings(for: configuration)
 
         logger.log("""
-            Tunnel starten: lokaal adres \(configuration.localAddress, privacy: .public), \
-            remote \(configuration.tunnelRemoteAddress, privacy: .public), \
+            Tunnel starten: interface \(configuration.deviceAddress, privacy: .public), \
+            peer \(configuration.peerAddress, privacy: .public), \
             MTU \(configuration.mtu, privacy: .public)
             """)
 
@@ -78,7 +91,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         logger.log("Tunnel stoppen, reden: \(reason.rawValue, privacy: .public)")
         relayBox.take()?.stop()
 
-        // Netwerkinstellingen opruimen zodat de utun-interface direct verdwijnt.
         setTunnelNetworkSettings(nil) { _ in
             completionHandler()
         }
@@ -114,38 +126,33 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     // MARK: - Slapen en ontwaken
 
     override func sleep(completionHandler: @escaping () -> Void) {
-        // Er is geen sessie om af te bouwen: de tunnel is volledig lokaal.
         completionHandler()
     }
 
     override func wake() {
-        // Niets te herstellen; de leeslus loopt gewoon door.
+        // De leeslus loopt gewoon door; niets te herstellen.
     }
 
     // MARK: - Netwerkinstellingen
 
-    /// Bouwt de instellingen voor de virtuele interface.
-    ///
-    /// `includedRoutes` bevat de default route, waardoor iOS al het IPv4-verkeer
-    /// naar deze interface stuurt. IPv6 wordt bewust niet geconfigureerd, zodat
-    /// er alleen een IPv4-interface ontstaat.
+    /// Alleen het tunnel-subnet wordt opgevangen. `excludedRoutes = [.default()]`
+    /// is essentieel: zonder die regel zou al het verkeer van het toestel de
+    /// tunnel in gaan en zou je internetverbinding eruit liggen.
     static func makeNetworkSettings(for configuration: TunnelConfiguration) -> NEPacketTunnelNetworkSettings {
-        let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: configuration.tunnelRemoteAddress)
+        let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: configuration.deviceAddress)
         settings.mtu = NSNumber(value: configuration.mtu)
 
-        let ipv4Settings = NEIPv4Settings(addresses: [configuration.localAddress],
+        let ipv4Settings = NEIPv4Settings(addresses: [configuration.deviceAddress],
                                           subnetMasks: [configuration.subnetMask])
-        ipv4Settings.includedRoutes = [NEIPv4Route.default()]
-        ipv4Settings.excludedRoutes = []
+        ipv4Settings.includedRoutes = [
+            NEIPv4Route(destinationAddress: configuration.deviceAddress,
+                        subnetMask: configuration.subnetMask)
+        ]
+        ipv4Settings.excludedRoutes = [NEIPv4Route.default()]
         settings.ipv4Settings = ipv4Settings
 
-        if configuration.capturesDNS {
-            let dnsSettings = NEDNSSettings(servers: configuration.dnsServers)
-            // Lege string matcht elk domein: ook DNS loopt via de tunnel.
-            dnsSettings.matchDomains = [""]
-            settings.dnsSettings = dnsSettings
-        }
-
+        // Bewust geen DNS-instellingen: de tunnel mag de naamsresolutie van het
+        // toestel niet overnemen.
         return settings
     }
 }

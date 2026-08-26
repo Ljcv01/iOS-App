@@ -48,8 +48,12 @@ struct VPNControlView: View {
                     Section("Statistieken") {
                         LabeledContent("Pakketten gelezen", value: "\(statistics.packetsRead)")
                         LabeledContent("Bytes gelezen", value: "\(statistics.bytesRead)")
-                        LabeledContent("Echo replies", value: "\(statistics.icmpEchoRepliesSent)")
-                        LabeledContent("Pakketten verworpen", value: "\(statistics.packetsDropped)")
+                        LabeledContent("Omgeleid (hairpin)", value: "\(statistics.packetsTranslated)")
+                        if statistics.packetsTranslated == 0 && statistics.packetsRead > 0 {
+                            Text("Er komt wel verkeer binnen, maar niets wordt omgeleid. Controleer of je naar \(TunnelConstants.peerAddress) verbindt.")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                        }
                     }
                 }
 
